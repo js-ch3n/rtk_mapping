@@ -10,7 +10,7 @@ GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO 
                    zero-origin)        from 0,0,0)   absolute position)
 ```
 
-- **`FAST_LIO`** — LiDAR-inertial odometry with an RTK mapping mode that replaces EKF state with external position fixes for globally-registered mapping.
+- **`FAST_LIO`** — LiDAR-inertial odometry supporting **three RTK operating modes** (see below). Modified from [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO).
 - **`gnss_conversion`** — Converts raw GNSS fixes (`sensor_msgs/NavSatFix`) into local ENU odometry (`nav_msgs/Odometry`) relative to the first received fix. Handles WGS84→ECEF→ENU transformation, heading-from-motion, antenna offset, jump detection, and origin reset.
 
 ## Requirements
@@ -35,6 +35,54 @@ catkin_make
 source devel/setup.bash
 ```
 
+## FAST_LIO RTK Mapping Modes
+
+FAST_LIO supports three operating modes for RTK/GNSS integration:
+
+| Mode | `rtk_mode_en` | `rtk_fuse_en` | Behavior |
+|------|:---:|:---:|---|
+| **1. Original FAST_LIO** | `false` | — | Pure LiDAR-IMU odometry. No RTK subscription. |
+| **2. RTK Localization** | `true` | `false` | RTK directly overrides EKF state each scan. LiDAR matching disabled. Simple, but trajectory follows RTK noise. |
+| **3. RTK Fusion** | `true` | `true` | RTK position added as measurement residual in IEKF, jointly optimized with LiDAR point-to-plane constraints. Smoother, survives RTK dropout. |
+
+### Mode 3: How fusion works
+
+In Mode 3, the IEKF measurement Jacobian `H` is extended with RTK position rows appended to the LiDAR point-to-plane rows:
+
+```
+H_full = [ H_lidar (m×12) ]
+         [ H_rtk   (3N×12) ]    N = rtk_repeat_n
+
+H_rtk  = [I₃ₓ₃ | 0₃ₓ₉]   repeated N times per RTK position fix
+```
+
+Each repetition of the RTK row is mathematically equivalent to reducing RTK measurement noise. Under the unified LiDAR noise model `R_lidar`, repeating N times gives:
+
+```
+N · ||pos(x) − z_rtk||² / R_lidar  =  ||pos(x) − z_rtk||² / (R_lidar / N)
+```
+
+i.e. effective RTK noise `R_rtk = R_lidar / N`. Higher N = trust RTK more.
+
+### Mode 3 tuning: `rtk_repeat_n`
+
+| RTK accuracy | Recommended N | Effective R_rtk |
+|-------------|:---:|:---:|
+| 1 cm | 10 | R_lidar / 10 |
+| 2 cm | 3–5 | R_lidar / 3–5 |
+| 5 cm | 1 | R_lidar (equal weight) |
+
+### Mode comparison
+
+| | Mode 2 (Override) | Mode 3 (Fusion) |
+|---|---|---|
+| LiDAR scan-matching | ✗ Disabled | ✓ Full IEKF |
+| RTK role | Replaces state | Measurement residual |
+| Trajectory smoothness | Follows RTK jitter | Smoothed by LiDAR |
+| RTK dropout | Mapping stops | Falls back to LiDAR-only |
+| Drift without RTK | Immediate | LiDAR-IMU maintains |
+| Computational cost | Low | Same as original FAST_LIO |
+
 ## Usage
 
 ### 1. Launch GNSS conversion
@@ -56,18 +104,29 @@ Configurable parameters (see `gnss_conversion/config/gnss_conversion.yaml`):
 | `heading_min_speed` | `0.5` | Min speed (m/s) to compute heading from motion |
 | `antenna_offset_x/y/z` | `0.0` | GNSS antenna offset in base_link frame |
 
-### 2. Launch RTK mapping (FAST_LIO)
+### 2. Configure FAST_LIO mode
+
+Edit `FAST_LIO/config/velodyne_rtk.yaml`:
+
+```yaml
+rtk:
+    rtk_mode_en: true        # enable RTK (false = Mode 1)
+    rtk_topic: "/rtk_odom"
+    rtk_fuse_en: true        # true = Mode 3 (fusion), false = Mode 2 (override)
+    rtk_repeat_n: 5          # Mode 3 only: trust RTK ~5× more than LiDAR
+```
+
+### 3. Launch
 
 ```bash
+# Terminal 1
+roslaunch gnss_conversion gnss_conversion.launch
+
+# Terminal 2
 roslaunch fast_lio mapping_velodyne_rtk.launch
 ```
 
-### 3. Combined launch
-
-```bash
-roslaunch gnss_conversion gnss_conversion.launch & 
-roslaunch fast_lio mapping_velodyne_rtk.launch
-```
+To switch modes, only the YAML config needs changing — no code recompilation required.
 
 ## Packages
 
