@@ -13,6 +13,14 @@ GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO 
 - **`FAST_LIO`** — LiDAR-inertial odometry supporting **three RTK operating modes** (see below). Modified from [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO).
 - **`gnss_conversion`** — Converts raw GNSS fixes (`sensor_msgs/NavSatFix`) into local ENU odometry (`nav_msgs/Odometry`) relative to the first received fix. Handles WGS84→ECEF→ENU transformation, heading-from-motion, antenna offset, jump detection, and origin reset.
 
+## Demo
+
+**RTK Fusion mode (Mode 3) — stable localization with LiDAR point-cloud mapping:**
+
+[📹 RTK Fusion Demo — stable localization with LiDAR mapping](docs/RTK_MAPPING.mp4)
+
+Mode 3 fuses RTK position into the IEKF as a measurement residual jointly optimized with LiDAR point-to-plane constraints. The trajectory stays globally aligned via RTK while LiDAR scan-matching smooths out GNSS jitter and maintains continuity through signal dropouts.
+
 ## Requirements
 
 - **ROS Noetic** (catkin workspace)
