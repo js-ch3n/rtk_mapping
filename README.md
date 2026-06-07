@@ -50,11 +50,11 @@ source devel/setup.bash
 
 FAST_LIO supports three operating modes for RTK/GNSS integration:
 
-| Mode | `rtk_mode_en` | `rtk_fuse_en` | RTK DOF | Behavior |
-|------|:---:|:---:|:---:|---|
-| **1. Original FAST_LIO** | `false` | — | — | Pure LiDAR-IMU odometry. No RTK subscription. |
-| **2. RTK Localization** | `true` | `false` | **6-DOF** | RTK pose (position + orientation) directly overrides EKF state each scan. LiDAR matching disabled. Full 6-DOF global localization, but trajectory follows RTK noise. |
-| **3. RTK Fusion** | `true` | `true` | **3-DOF** | RTK position only added as measurement residual in IEKF, jointly optimized with LiDAR point-to-plane constraints. Orientation from LiDAR-IMU. Smoother, survives RTK dropout. |
+| Mode | Name | `rtk_mode_en` | `rtk_fuse_en` | RTK DOF | Behavior |
+| :---: | --- | :---: | :---: | :---: | --- |
+| **1** | Original FAST_LIO | `false` | — | — | Pure LiDAR-IMU odometry. No RTK subscription. |
+| **2** | RTK Localization | `true` | `false` | **6-DOF** | RTK pose (position + orientation) directly overrides EKF state each scan. LiDAR matching disabled. Full 6-DOF global localization, but trajectory follows RTK noise. |
+| **3** | RTK Fusion | `true` | `true` | **3-DOF** | RTK position only added as measurement residual in IEKF, jointly optimized with LiDAR point-to-plane constraints. Orientation from LiDAR-IMU. Smoother, survives RTK dropout. |
 
 
 ### Mode 3 tuning: `rtk_repeat_n`
