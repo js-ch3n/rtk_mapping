@@ -27,6 +27,8 @@ mapping:
 rtk:
     rtk_mode_en: true
     rtk_topic: "/rtk_odom"
+    rtk_fuse_en: false      # true=RTK参与IEKF残差融合, false=RTK直接覆盖定位(legacy)
+    rtk_repeat_n: 5         # RTK信任度:重复行数N=R_lidar/R_rtk (>1=更信RTK, 1=等权)
 
 publish:
     path_en:  true

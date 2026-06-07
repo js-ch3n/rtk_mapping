@@ -128,6 +128,8 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 
 /*** RTK Mapping Mode ***/
 bool   rtk_mode_en = false;
+bool   rtk_fuse_en = false;   // true=RTK残差融合, false=直接覆盖定位
+int    rtk_repeat_n = 5;      // RTK位置测量重复行数 (等效降噪因子N=R_lidar/R_rtk)
 string rtk_topic = "/rtk_odom";
 deque<nav_msgs::Odometry::ConstPtr> rtk_buffer;
 V3D    prev_rtk_pos = Zero3d;
@@ -426,9 +428,8 @@ bool sync_packages(MeasureGroup &meas)
         return false;
     }
 
-    // In RTK mode, also wait for RTK data to cover lidar_end_time
-    // (same pattern as IMU: need data past scan end for interpolation)
-    if (rtk_mode_en && last_timestamp_rtk < lidar_end_time)
+    // RTK wait: mode 2 (override) must wait for RTK; mode 3 (fusion) runs without
+    if (rtk_mode_en && !rtk_fuse_en && last_timestamp_rtk < lidar_end_time)
     {
         return false;
     }
@@ -454,6 +455,10 @@ bool sync_packages(MeasureGroup &meas)
         while (!rtk_buffer.empty() &&
                rtk_buffer.front()->header.stamp.toSec() < clean_thresh)
             rtk_buffer.pop_front();
+
+        // Mode 3 (fusion): skip if no RTK data yet — runs LiDAR-only this scan
+        if (rtk_buffer.empty())
+            goto skip_rtk_sync;
 
         // Find two RTK messages bracketing lidar_end_time
         // before: last with stamp <= lidar_end_time
@@ -844,6 +849,43 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+
+    /*** Append RTK position measurement rows (fusion mode) ***/
+    if (rtk_mode_en && rtk_fuse_en && Measures.has_rtk)
+    {
+        int orig_rows = effct_feat_num;
+        int rtk_rows  = rtk_repeat_n * 3;  // X,Y,Z repeated N times
+
+        // Copy existing LiDAR Jacobian and residuals into expanded matrices
+        MatrixXd h_x_lidar = ekfom_data.h_x;  // (orig_rows × 12)
+        VectorXd h_lidar   = ekfom_data.h;    // (orig_rows × 1)
+
+        ekfom_data.h_x = MatrixXd::Zero(orig_rows + rtk_rows, 12);
+        ekfom_data.h.resize(orig_rows + rtk_rows);
+
+        ekfom_data.h_x.topRows(orig_rows) = h_x_lidar;
+        ekfom_data.h.head(orig_rows)      = h_lidar;
+
+        // RTK innovation: z_rtk - h_rtk(x) = rtk_pos - state.pos
+        V3D innovation = Measures.rtk_pos - s.pos;
+
+        // Fill repeated RTK position rows
+        // Each repetition = 3 rows (X, Y, Z) with Jacobian = I at pos cols 0-2
+        for (int k = 0; k < rtk_repeat_n; k++)
+        {
+            int r = orig_rows + k * 3;
+            // X: ∂h/∂pos_x = 1, all others 0
+            ekfom_data.h_x(r, 0) = 1.0;
+            ekfom_data.h(r)      = innovation(0);
+            // Y: ∂h/∂pos_y = 1
+            ekfom_data.h_x(r + 1, 1) = 1.0;
+            ekfom_data.h(r + 1)      = innovation(1);
+            // Z: ∂h/∂pos_z = 1
+            ekfom_data.h_x(r + 2, 2) = 1.0;
+            ekfom_data.h(r + 2)      = innovation(2);
+        }
+    }
+
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -886,6 +928,8 @@ int main(int argc, char** argv)
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
     nh.param<bool>("rtk/rtk_mode_en", rtk_mode_en, false);
+    nh.param<bool>("rtk/rtk_fuse_en", rtk_fuse_en, false);
+    nh.param<int> ("rtk/rtk_repeat_n", rtk_repeat_n, 5);
     nh.param<string>("rtk/rtk_topic", rtk_topic, "/rtk_odom");
 
     p_pre->lidar_type = lidar_type;
@@ -946,7 +990,12 @@ int main(int argc, char** argv)
     if (rtk_mode_en)
     {
         sub_rtk = nh.subscribe<nav_msgs::Odometry>(rtk_topic, 200000, rtk_odom_cbk);
-        ROS_INFO("RTK mapping mode enabled, subscribing to %s", rtk_topic.c_str());
+        ROS_INFO("RTK mode: %s, subscribing to %s",
+                 rtk_fuse_en ? "FUSION (RTK residuals in IEKF)" : "LOCALIZATION (RTK state override)",
+                 rtk_topic.c_str());
+        if (rtk_fuse_en)
+            ROS_INFO("RTK fusion: repeat_n=%d (equiv R_rtk = R_lidar/%.1f)",
+                     rtk_repeat_n, (double)rtk_repeat_n);
     }
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
@@ -978,9 +1027,9 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            if (rtk_mode_en)
+            if (rtk_mode_en && !rtk_fuse_en)
             {
-                /**** RTK Mapping Mode ****/
+                /**** Mode 2: RTK Localization (state override, no LiDAR matching) ****/
                 // IMU handles undistortion independently (Process calls
                 // UndistortPcl which only uses relative IMU motion within
                 // the scan). RTK only provides absolute pose for world-
@@ -1104,7 +1153,8 @@ int main(int argc, char** argv)
             }
             else
             {
-                /**** Original FAST_LIO Pipeline ****/
+                /**** Mode 1: Original FAST_LIO   or   Mode 3: RTK Fusion ****/
+                /*** (Mode 3: h_share_model appends RTK rows when Measures.has_rtk) ***/
                 double t0,t1,t2,t3,t4,t5,match_start, solve_start, svd_time;
 
                 match_time = 0;
