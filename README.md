@@ -13,6 +13,8 @@ GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO 
 - **`FAST_LIO`** — LiDAR-inertial odometry supporting **three RTK operating modes** (see below). Modified from [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO).
 - **`gnss_conversion`** — Converts raw GNSS fixes (`sensor_msgs/NavSatFix`) into local ENU odometry (`nav_msgs/Odometry`) relative to the first received fix. Handles WGS84→ECEF→ENU transformation, heading-from-motion, antenna offset, jump detection, and origin reset.
 
+> **Note:** `gnss_conversion` currently provides **3-DOF position only** (ENU x, y, z). The orientation in the output Odometry is a yaw estimate computed from consecutive position deltas — there is **no pitch/roll from GNSS**. Downstream, FAST_LIO Mode 2 uses this yaw to set full 6-DOF pose; Mode 3 uses position only, letting LiDAR-IMU handle orientation.
+
 ## Demo
 
 **RTK Fusion mode (Mode 3) — stable localization with LiDAR point-cloud mapping:**
@@ -20,7 +22,7 @@ GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO 
 
 ![RTK Fusion Demo](docs/RTK_MAPPING.gif)
 
-*Mode 3 — RTK position fused into IEKF with LiDAR point-to-plane constraints. Globally aligned, jitter-smoothed, continuous through RTK dropouts.*
+*Mode 3 — tested in a degraded tunnel scenario. Ground-truth trajectory was converted to simulated RTK 6-DOF measurements for fusion. With RTK fusion enabled, localization remains stable throughout; without fusion, LiDAR-IMU odometry degrades severely in the feature-sparse tunnel environment.*
 
 
 
