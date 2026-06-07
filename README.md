@@ -17,15 +17,12 @@ GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO 
 
 **RTK Fusion mode (Mode 3) — stable localization with LiDAR point-cloud mapping:**
 
-<<<<<<< HEAD
+
 ![RTK Fusion Demo](docs/RTK_MAPPING.gif)
 
 *Mode 3 — RTK position fused into IEKF with LiDAR point-to-plane constraints. Globally aligned, jitter-smoothed, continuous through RTK dropouts.*
-=======
-[▶ Watch demo](docs/RTK_MAPPING.mp4)
 
-Mode 3 fuses RTK position into the IEKF as a measurement residual jointly optimized with LiDAR point-to-plane constraints. The trajectory stays globally aligned via RTK while LiDAR scan-matching smooths out GNSS jitter and maintains continuity through signal dropouts.
->>>>>>> 25e8bd7d256834ecbb871fd8331ec341a87a03c8
+
 
 ## Requirements
 
