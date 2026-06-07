@@ -50,30 +50,12 @@ source devel/setup.bash
 
 FAST_LIO supports three operating modes for RTK/GNSS integration:
 
-| Mode | `rtk_mode_en` | `rtk_fuse_en` | Behavior |
-|------|:---:|:---:|---|
-| **1. Original FAST_LIO** | `false` | — | Pure LiDAR-IMU odometry. No RTK subscription. |
-| **2. RTK Localization** | `true` | `false` | RTK directly overrides EKF state each scan. LiDAR matching disabled. Simple, but trajectory follows RTK noise. |
-| **3. RTK Fusion** | `true` | `true` | RTK position added as measurement residual in IEKF, jointly optimized with LiDAR point-to-plane constraints. Smoother, survives RTK dropout. |
+| Mode | `rtk_mode_en` | `rtk_fuse_en` | RTK DOF | Behavior |
+|------|:---:|:---:|:---:|---|
+| **1. Original FAST_LIO** | `false` | — | — | Pure LiDAR-IMU odometry. No RTK subscription. |
+| **2. RTK Localization** | `true` | `false` | **6-DOF** | RTK pose (position + orientation) directly overrides EKF state each scan. LiDAR matching disabled. Full 6-DOF global localization, but trajectory follows RTK noise. |
+| **3. RTK Fusion** | `true` | `true` | **3-DOF** | RTK position only added as measurement residual in IEKF, jointly optimized with LiDAR point-to-plane constraints. Orientation from LiDAR-IMU. Smoother, survives RTK dropout. |
 
-### Mode 3: How fusion works
-
-In Mode 3, the IEKF measurement Jacobian `H` is extended with RTK position rows appended to the LiDAR point-to-plane rows:
-
-```
-H_full = [ H_lidar (m×12) ]
-         [ H_rtk   (3N×12) ]    N = rtk_repeat_n
-
-H_rtk  = [I₃ₓ₃ | 0₃ₓ₉]   repeated N times per RTK position fix
-```
-
-Each repetition of the RTK row is mathematically equivalent to reducing RTK measurement noise. Under the unified LiDAR noise model `R_lidar`, repeating N times gives:
-
-```
-N · ||pos(x) − z_rtk||² / R_lidar  =  ||pos(x) − z_rtk||² / (R_lidar / N)
-```
-
-i.e. effective RTK noise `R_rtk = R_lidar / N`. Higher N = trust RTK more.
 
 ### Mode 3 tuning: `rtk_repeat_n`
 
@@ -87,6 +69,8 @@ i.e. effective RTK noise `R_rtk = R_lidar / N`. Higher N = trust RTK more.
 
 | | Mode 2 (Override) | Mode 3 (Fusion) |
 |---|---|---|
+| RTK degrees of freedom | **6-DOF** (position + orientation) | **3-DOF** (position only) |
+| Orientation source | RTK (from GNSS heading) | LiDAR-IMU |
 | LiDAR scan-matching | ✗ Disabled | ✓ Full IEKF |
 | RTK role | Replaces state | Measurement residual |
 | Trajectory smoothness | Follows RTK jitter | Smoothed by LiDAR |
