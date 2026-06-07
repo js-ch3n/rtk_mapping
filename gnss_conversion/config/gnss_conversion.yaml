@@ -1,0 +1,39 @@
+# GNSS Conversion Configuration
+# Converts raw RTK NavSatFix into zero-based odometry for FAST_LIO RTK mapping.
+
+# ── I/O ────────────────────────────────────────────────────────────────
+# Input: topic publishing raw GNSS fix as sensor_msgs/NavSatFix
+input_rtk_topic: "/rtk_fix"
+
+# Output: topic FAST_LIO subscribes to in RTK mapping mode
+# (nav_msgs/Odometry, position relative to first fix)
+output_odom_topic: "/rtk_odom"
+
+# ── Frame IDs ──────────────────────────────────────────────────────────
+world_frame_id: "odom"
+child_frame_id: "base_link"
+
+# ── TF ─────────────────────────────────────────────────────────────────
+publish_tf: true    # broadcast odom → base_link transform
+
+# ── Jump Detection ─────────────────────────────────────────────────────
+# If relative position jumps > threshold (meters), reset origin to current fix.
+# Handles GNSS receiver restarts / coordinate resets.
+reset_on_jump: true
+jump_threshold: 50.0
+
+# ── Heading ────────────────────────────────────────────────────────────
+# Minimum horizontal speed (m/s) to compute heading from position delta.
+# Below this speed, the last valid heading is held.
+heading_min_speed: 0.5
+
+# ── Fix Quality ────────────────────────────────────────────────────────
+# Minimum NavSatFix status to accept:
+#   -1 = NO_FIX, 0 = FIX, 1 = SBAS_FIX, 2 = GBAS_FIX
+fix_status_min: 0
+
+# ── Antenna Offset ─────────────────────────────────────────────────────
+# GNSS antenna offset in base_link frame (x=forward, y=left, z=up)
+antenna_offset_x: 0.0
+antenna_offset_y: 0.0
+antenna_offset_z: 0.0

@@ -1,8 +1,29 @@
-build
-Log/*.png
+# Catkin workspace artifacts — never commit
+build/
+devel/
+install/
+.catkin_tools/
+CMakeLists.txt
+
+# IDE
+.vscode/
+.marscode/
+.idea/
+
+# OS junk
+.DS_Store
+*.swp
+*.swo
+Thumbs.db
+
+# Build artifacts
+*.o
+*.a
+*.so
+
+# ROS logs
+*.log
 Log/*.txt
 Log/*.csv
+Log/*.png
 Log/*.pdf
-.vscode/c_cpp_properties.json
-.vscode/settings.json
-PCD/*.pcd

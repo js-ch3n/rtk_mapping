@@ -1,36 +1,87 @@
 # RTK Mapping
 
-基于 [FAST-LIO](https://github.com/hku-mars/FAST_LIO) 改进的激光-惯性- RTK 融合定位与建图方案。
+LiDAR mapping system that uses **RTK/GNSS positioning** to build globally-aligned point-cloud maps in real time. Built on [FAST_LIO](https://github.com/hku-mars/FAST_LIO) with an added **GNSS conversion** layer that transforms raw `sensor_msgs/NavSatFix` data into zero-based odometry.
 
-## 主要改进
+## Overview
 
-- **点云去运动畸变**：利用 IMU 预积分和反向传播对原始 LiDAR 点云进行逐点运动补偿，消除高速运动下的点云畸变。
-- **RTK 定位融合**：在 FAST-LIO 的紧耦合迭代卡尔曼滤波框架中融合 RTK 全局观测，抑制长时漂移，提供绝对位姿约束。
-- **激光建图**：将去畸变后的点云注册到全局地图，输出高精度稠密点云地图。
+```
+GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO (RTK mode)
+(lat/lon/alt)     (WGS84→ENU,         (Odometry    (LiDAR mapping with
+                   zero-origin)        from 0,0,0)   absolute position)
+```
 
-## 依赖
+- **`FAST_LIO`** — LiDAR-inertial odometry with an RTK mapping mode that replaces EKF state with external position fixes for globally-registered mapping.
+- **`gnss_conversion`** — Converts raw GNSS fixes (`sensor_msgs/NavSatFix`) into local ENU odometry (`nav_msgs/Odometry`) relative to the first received fix. Handles WGS84→ECEF→ENU transformation, heading-from-motion, antenna offset, jump detection, and origin reset.
 
-- Ubuntu >= 18.04 + ROS Melodic/Noetic
-- PCL >= 1.8
-- Eigen >= 3.3.4
-- [livox_ros_driver](https://github.com/Livox-SDK/livox_ros_driver)（如使用 Livox 系列雷达）
+## Requirements
 
-## 构建
+- **ROS Noetic** (catkin workspace)
+- **Eigen3**
+- **PCL ≥ 1.8**
+- **Livox SDK** (for Livox LiDAR; see [Livox-SDK](https://github.com/Livox-SDK/Livox-SDK))
+
+## Build
 
 ```bash
+# Clone into your catkin workspace
 cd ~/catkin_ws/src
-git clone <this-repo-url>
+git clone --recursive https://github.com/<your-org>/rtk_mapping.git
 cd ..
+
+# Build
 catkin_make
+# or: catkin build
+
 source devel/setup.bash
 ```
 
-## 运行
+## Usage
+
+### 1. Launch GNSS conversion
 
 ```bash
-roslaunch rtk_mapping mapping.launch
+roslaunch gnss_conversion gnss_conversion.launch \
+    input_rtk_topic:=/your_gnss_fix \
+    output_odom_topic:=/rtk_odom
 ```
 
-## 致谢
+Configurable parameters (see `gnss_conversion/config/gnss_conversion.yaml`):
 
-本项目基于香港大学火星实验室 [FAST-LIO](https://github.com/hku-mars/FAST_LIO) 框架开发，感谢原作者的杰出工作。
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `input_rtk_topic` | `/rtk_fix` | Input GNSS topic (`sensor_msgs/NavSatFix`) |
+| `output_odom_topic` | `/rtk_odom` | Output odometry topic (`nav_msgs/Odometry`) |
+| `publish_tf` | `true` | Broadcast `odom→base_link` TF |
+| `jump_threshold` | `50.0` | Reset origin on position jump (meters) |
+| `heading_min_speed` | `0.5` | Min speed (m/s) to compute heading from motion |
+| `antenna_offset_x/y/z` | `0.0` | GNSS antenna offset in base_link frame |
+
+### 2. Launch RTK mapping (FAST_LIO)
+
+```bash
+roslaunch fast_lio mapping_velodyne_rtk.launch
+```
+
+### 3. Combined launch
+
+```bash
+roslaunch gnss_conversion gnss_conversion.launch & 
+roslaunch fast_lio mapping_velodyne_rtk.launch
+```
+
+## Packages
+
+| Package | Description |
+|---------|-------------|
+| [`FAST_LIO`](FAST_LIO/) | LiDAR-inertial odometry + RTK mapping mode (modified from [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO)) |
+| [`gnss_conversion`](gnss_conversion/) | GNSS NavSatFix → zero-based odometry conversion |
+
+## Coordinate Frames
+
+- **`odom`** — Local ENU frame with origin at the first GNSS fix
+- **`base_link`** — Vehicle body frame (TF broadcast by `gnss_conversion`)
+- **`camera_init`** — FAST_LIO map frame (first LiDAR scan pose)
+
+## License
+
+FAST_LIO is distributed under BSD license. See [FAST_LIO/LICENSE](FAST_LIO/LICENSE).
