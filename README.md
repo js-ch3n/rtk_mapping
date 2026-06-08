@@ -82,7 +82,9 @@ FAST_LIO supports three operating modes for RTK/GNSS integration:
 
 ### Known Issue: Coordinate Frame Misalignment in Mode 3
 
-Mode 3 computes the RTK residual as `rtk_pos − state.pos`, which assumes both vectors live in the same coordinate frame. In practice they do not:
+Mode 3 computes the RTK residual as `rtk_pos − state.pos`, which assumes both vectors live in the same coordinate frame. In practice they do not.
+
+#### 1. Coordinate Frame Definitions
 
 | Frame | Origin | Axes |
 |-------|--------|------|
@@ -91,19 +93,25 @@ Mode 3 computes the RTK residual as `rtk_pos − state.pos`, which assumes both 
 
 The transformation between them is **SE(3)** — a full 6-DOF rigid body displacement (translation from GNSS antenna to LiDAR mounting point, rotation from ENU axes to LiDAR initial heading).
 
-**Why Mode 2 doesn't have this problem:** Mode 2 replaces the EKF state with the RTK pose on the very first scan, effectively rebasing the entire mapping pipeline into the RTK ENU frame. Mode 3 preserves the original FAST_LIO coordinate frame (LiDAR `camera_init`), so the two measurements are in different coordinate systems.
+#### 2. Why Mode 2 Is Unaffected
 
-**Impact:** When the vehicle starts with a heading significantly different from East (e.g., pointing North), the residual `rtk_pos − state.pos` mixes components from misaligned axes — the East residual bleeds into the North channel and vice versa. This degrades fusion quality and can cause inconsistent EKF updates.
+Mode 2 replaces the EKF state with the RTK pose on the very first scan, effectively rebasing the entire mapping pipeline into the RTK ENU frame. Mode 3 preserves the original FAST_LIO coordinate frame (LiDAR `camera_init`), so the two measurements live in different coordinate systems.
 
-**Planned fix:** Online SE(2) alignment. On the first valid RTK fix, record both `rtk_pos₀` and `state.pos₀` to estimate a translation offset. Accumulate motion deltas over the first few seconds to estimate the yaw offset between the two frames via:
+#### 3. Impact
 
-```
+When the vehicle starts with a heading significantly different from East (e.g., pointing North), the residual `rtk_pos − state.pos` mixes components from misaligned axes — the East residual bleeds into the North channel and vice versa. This degrades fusion quality and can cause inconsistent EKF updates.
+
+#### 4. Planned Fix: Online SE(2) Alignment
+
+On the first valid RTK fix, record both `rtk_pos₀` and `state.pos₀` to estimate a translation offset. Accumulate motion deltas over the first few seconds to estimate the yaw offset between the two frames:
+
+```text
 θ_offset = median( atan2(Δrtk_y, Δrtk_x) − atan2(Δekf_y, Δekf_x) )
 ```
 
 Then transform all subsequent RTK measurements into the LiDAR frame before computing residuals:
 
-```
+```text
 rtk_cam = R_z(θ_offset)ᵀ · (rtk_pos − T_offset)
 innovation = rtk_cam − state.pos
 ```
