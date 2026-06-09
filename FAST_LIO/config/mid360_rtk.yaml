@@ -1,0 +1,55 @@
+common:
+    lid_topic:  "/livox/lidar"
+    imu_topic:  "/livox/imu"
+    time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                  # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+preprocess:
+    lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR,
+    scan_line: 4
+    blind: 0.5
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree:    360
+    det_range:     100.0
+    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+    extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+
+rtk:
+    rtk_mode_en: true
+    rtk_topic: "/rtk/odom"
+    rtk_fuse_en: true       # true=RTK参与IEKF残差融合(MODE 3), false=RTK直接覆盖定位(MODE 2)
+    rtk_pos_cov: 0.01       # RTK位置测量噪声 (m²), MODE 3 独立校正用
+    # rtk_repeat_n: 5       # (废弃, 由 rtk_pos_cov 替代)
+
+    # MODE 3 扩展: 外部航向融合 + 刚体变换在线估计
+    rtk_yaw_en: true                       # 启用 /rtk_yaw 外部航向约束 R_lidar2enu yaw
+    rtk_yaw_topic: "/rtk/heading"              # nav_msgs::Odometry, 取 pose.orientation yaw
+    yaw_from_east_cw: true                 # 源约定: 顺时针从东; 内部转 CCW from East
+    rtk_yaw_cov: 0.05                      # 航向残差协方差 (rad²)
+
+    lidar_enu_est_en: true                 # 在线估计 R_lidar2enu / t_lidar2enu
+    init_R_lidar2enu: [1, 0, 0,
+                       0, 1, 0,
+                       0, 0, 1]            # 启动初值, 行主序; 就用heading
+    init_t_lidar2enu: [0, 0, 0]            # 启动初值 (m)。 
+    use_first_rtk_as_origin: false         # true=把首个 RTK 当作 ENU 原点
+
+publish:
+    path_en:  false
+    scan_publish_en:  true       # false: close all the point cloud output
+    dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
+    scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+pcd_save:
+    pcd_save_en: true
+    interval: -1                 # how many LiDAR frames saved in each pcd file;
+                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

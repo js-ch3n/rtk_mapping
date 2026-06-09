@@ -19,18 +19,7 @@
 
     <node pkg="gnss_conversion" type="gnss_conversion_4dof_node"
           name="gnss_conversion_4dof" output="screen">
-        <param name="input_fix_topic"   value="$(arg input_fix_topic)" />
-        <param name="input_yaw_topic"   value="$(arg input_yaw_topic)" />
-        <param name="output_odom_topic" value="$(arg output_odom_topic)" />
-        <param name="world_frame_id"    value="$(arg world_frame_id)" />
-        <param name="child_frame_id"    value="$(arg child_frame_id)" />
-        <param name="publish_tf"        value="$(arg publish_tf)" />
-        <param name="reset_on_jump"     value="$(arg reset_on_jump)" />
-        <param name="jump_threshold"    value="$(arg jump_threshold)" />
-        <param name="fix_status_min"    value="$(arg fix_status_min)" />
-        <param name="yaw_from_east_cw"  value="$(arg yaw_from_east_cw)" />
-        <param name="antenna_offset_x"  value="$(arg antenna_offset_x)" />
-        <param name="antenna_offset_y"  value="$(arg antenna_offset_y)" />
-        <param name="antenna_offset_z"  value="$(arg antenna_offset_z)" />
+        <rosparam command="load"
+                  file="$(find gnss_conversion)/config/gnss_conversion_4dof.yaml" />
     </node>
 </launch>

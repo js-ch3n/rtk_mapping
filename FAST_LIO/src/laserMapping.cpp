@@ -130,6 +130,7 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 bool   rtk_mode_en = false;
 bool   rtk_fuse_en = false;   // true=RTK残差融合, false=直接覆盖定位
 int    rtk_repeat_n = 5;      // RTK位置测量重复行数 (等效降噪因子N=R_lidar/R_rtk)
+double rtk_pos_cov = 0.01;    // RTK位置残差协方差 (m²), 替代 rtk_repeat_n 的等效噪声
 string rtk_topic = "/rtk_odom";
 deque<nav_msgs::Odometry::ConstPtr> rtk_buffer;
 V3D    prev_rtk_pos = Zero3d;
@@ -808,6 +809,130 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
+// ─── MODE 3 独立校正: RTK 位置 ─────────────────────────────────────────
+// 在 IEKF LiDAR 迭代收敛后, 用标准 EKF 公式做一次 RTK 位置更新。
+// 状态变量: s.pos (cols 0-2), R_lidar2enu (cols 23-25), t_lidar2enu (cols 26-28)
+void apply_rtk_correction(esekfom::esekf<state_ikfom, 12, input_ikfom> &kf,
+                           const MeasureGroup &meas, double rtk_cov, bool lidar_enu_est_en)
+{
+    constexpr int SD = state_ikfom::DOF;  // 29
+    state_ikfom s = kf.get_x();
+    auto P = kf.get_P();
+
+    // 预测: h(x) = R_lidar2enu * pos + t_lidar2enu
+    M3D R_Le   = s.R_lidar2enu.toRotationMatrix();
+    V3D h_pred = R_Le * s.pos + s.t_lidar2enu;
+    V3D innov  = meas.rtk_pos - h_pred;
+
+    // 雅可比 H (3 × 29)
+    Eigen::Matrix<double, 3, SD> H = Eigen::Matrix<double, 3, SD>::Zero();
+    H.template block<3, 3>(0, 0) = R_Le;                      // ∂h/∂pos
+    if (lidar_enu_est_en)
+    {
+        M3D hat_p;
+        hat_p << SKEW_SYM_MATRX(s.pos);
+        H.template block<3, 3>(0, 23) = -R_Le * hat_p;       // ∂h/∂R_lidar2enu (SO3 右扰动)
+    }
+    H.template block<3, 3>(0, 26) = M3D::Identity();          // ∂h/∂t_lidar2enu
+
+    // 卡尔曼增益: K = P·Hᵀ · (H·P·Hᵀ + R)⁻¹
+    Eigen::Matrix3d R_rtk = Eigen::Matrix3d::Identity() * rtk_cov;
+    Eigen::Matrix3d S = H * P * H.transpose() + R_rtk;
+    Eigen::Matrix<double, SD, 3> K = P * H.transpose() * S.inverse();
+
+    // 状态更新 (boxplus 自动处理 SO3 右扰动/S2 归一化)
+    Eigen::Matrix<double, SD, 1> dx = K * innov;
+    s.boxplus(dx);
+
+    // 协方差更新 (Joseph 形式, 数值更稳定)
+    Eigen::Matrix<double, SD, SD> I_KH =
+        Eigen::Matrix<double, SD, SD>::Identity() - K * H;
+    Eigen::Matrix<double, SD, SD> P_new =
+        I_KH * P * I_KH.transpose() + K * R_rtk * K.transpose();
+
+    kf.change_x(s);
+    kf.change_P(P_new);
+}
+
+// ─── MODE 3 独立校正: 外部航向 yaw ──────────────────────────────────────
+// 约束 R_lidar2enu 的 yaw DOF, 使总旋转 M = R_lidar2enu * rot 的 yaw 接近外部测量。
+// 状态变量: s.rot (cols 3-5), R_lidar2enu (cols 23-25)
+void apply_yaw_correction(esekfom::esekf<state_ikfom, 12, input_ikfom> &kf,
+                           const MeasureGroup &meas, double yaw_cov, bool lidar_enu_est_en)
+{
+    constexpr int SD = state_ikfom::DOF;  // 29
+    state_ikfom s = kf.get_x();
+    auto P = kf.get_P();
+
+    // 总旋转 M = R_lidar2enu * rot (LiDAR 初始系 → ENU)
+    M3D M     = s.R_lidar2enu.toRotationMatrix() * s.rot.toRotationMatrix();
+    double psi_pred = std::atan2(M(1,0), M(0,0));
+    double dyaw = meas.rtk_yaw - psi_pred;
+    if (dyaw >  M_PI) dyaw -= 2 * M_PI;
+    if (dyaw < -M_PI) dyaw += 2 * M_PI;
+
+    // ── 解析雅可比: psi = atan2(M_{1,0}, M_{0,0}) ─────────────────
+    double d = M(0,0)*M(0,0) + M(1,0)*M(1,0);
+    if (d < 1e-12) d = 1e-12;
+    double dp_dM00 = -M(1,0) / d;   // ∂psi/∂M_{0,0}
+    double dp_dM10 =  M(0,0) / d;   // ∂psi/∂M_{1,0}
+
+    // 偏导辅助函数: 给定 3×3 矩阵 dM_dx, 提取其对 psi 的标量贡献
+    auto dpsi_from_dM = [&](const M3D &dM_dx) {
+        return dp_dM00 * dM_dx(0,0) + dp_dM10 * dM_dx(1,0);
+    };
+
+    // 对 s.rot 的雅可比 (δφ 右扰动):
+    //   M(δφ) = R_Le * rot * Exp(δφ) = M * Exp(δφ) ≈ M * (I + hat(δφ))
+    //   dM/dδφ_k = M * hat(e_k)
+    Eigen::Matrix<double, 1, 3> dpsi_drot = Eigen::Matrix<double, 1, 3>::Zero();
+    for (int k = 0; k < 3; k++)
+    {
+        V3D ek = V3D::Zero();  ek(k) = 1.0;
+        M3D ek_hat;  ek_hat << SKEW_SYM_MATRX(ek);
+        dpsi_drot(k) = dpsi_from_dM(M * ek_hat);
+    }
+
+    // 对 R_lidar2enu 的雅可比 (δθ 右扰动):
+    //   M(δθ) = R_Le * Exp(δθ) * rot ≈ M + R_Le * hat(δθ) * rot
+    //   dM/dδθ_k = R_Le * hat(e_k) * rot
+    M3D R_Le = s.R_lidar2enu.toRotationMatrix();
+    M3D R_imu = s.rot.toRotationMatrix();
+    Eigen::Matrix<double, 1, 3> dpsi_dRle = Eigen::Matrix<double, 1, 3>::Zero();
+    if (lidar_enu_est_en)
+    {
+        for (int k = 0; k < 3; k++)
+        {
+            V3D ek = V3D::Zero();  ek(k) = 1.0;
+            M3D ek_hat;  ek_hat << SKEW_SYM_MATRX(ek);
+            dpsi_dRle(k) = dpsi_from_dM(R_Le * ek_hat * R_imu);
+        }
+    }
+
+    // 拼雅可比 H (1 × 29)
+    Eigen::Matrix<double, 1, SD> H = Eigen::Matrix<double, 1, SD>::Zero();
+    H.template block<1, 3>(0, 3)  = dpsi_drot;   // cols 3-5
+    if (lidar_enu_est_en)
+        H.template block<1, 3>(0, 23) = dpsi_dRle; // cols 23-25
+
+    // 卡尔曼增益: K = P·Hᵀ / (H·P·Hᵀ + yaw_cov)
+    double S = H * P * H.transpose() + yaw_cov;
+    Eigen::Matrix<double, SD, 1> K = P * H.transpose() / S;
+
+    // 状态更新
+    Eigen::Matrix<double, SD, 1> dx = K * dyaw;
+    s.boxplus(dx);
+
+    // 协方差更新 (Joseph)
+    Eigen::Matrix<double, SD, SD> I_KH =
+        Eigen::Matrix<double, SD, SD>::Identity() - K * H;
+    Eigen::Matrix<double, SD, SD> P_new =
+        I_KH * P * I_KH.transpose() + K * yaw_cov * K.transpose();
+
+    kf.change_x(s);
+    kf.change_P(P_new);
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -889,9 +1014,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     match_time  += omp_get_wtime() - match_start;
     double solve_start_  = omp_get_wtime();
     
-    /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-    // State dim is 29 (3+3+3+3+3+3+3+2+3+3). LiDAR rows only fill cols 0-11; rest stay zero.
-    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 29);
+    /*** Computation of Measurement Jacobian matrix H and measurements vector ***/
+    // LiDAR 点面距离残差只依赖前 12 列 (pos, rot, offset_R_L_I, offset_T_L_I)。
+    // RTK / yaw 残差由主循环中 apply_rtk_correction / apply_yaw_correction 独立处理。
+    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);
     ekfom_data.h.resize(effct_feat_num);
 
     for (int i = 0; i < effct_feat_num; i++)
@@ -908,7 +1034,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         const PointType &norm_p = corr_normvect->points[i];
         V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
 
-        /*** calculate the Measuremnt Jacobian matrix H ***/
+        /*** calculate the Measurement Jacobian matrix H ***/
         V3D C(s.rot.conjugate() *norm_vec);
         V3D A(point_crossmat * C);
         if (extrinsic_est_en)
@@ -920,96 +1046,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         {
             ekfom_data.h_x.block<1, 12>(i,0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
         }
-        // cols 12-28 (vel, bg, ba, grav, R_lidar2enu, t_lidar2enu) are zero by MatrixXd::Zero
 
-        /*** Measuremnt: distance to the closest surface/corner ***/
+        /*** Measurement: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
-    }
-
-    /*** Append RTK position measurement rows (fusion mode) ***/
-    if (rtk_mode_en && rtk_fuse_en && Measures.has_rtk)
-    {
-        int orig_rows = effct_feat_num;
-        int rtk_rows  = rtk_repeat_n * 3;  // X,Y,Z repeated N times
-
-        // Copy existing LiDAR Jacobian and residuals into expanded matrices
-        MatrixXd h_x_lidar = ekfom_data.h_x;  // (orig_rows × 29)
-        VectorXd h_lidar   = ekfom_data.h;    // (orig_rows × 1)
-
-        ekfom_data.h_x = MatrixXd::Zero(orig_rows + rtk_rows, 29);
-        ekfom_data.h.resize(orig_rows + rtk_rows);
-
-        ekfom_data.h_x.topRows(orig_rows) = h_x_lidar;
-        ekfom_data.h.head(orig_rows)      = h_lidar;
-
-        // RTK measurement: predicted = R_lidar2enu * s.pos + t_lidar2enu
-        // Jacobian w.r.t.:
-        //   s.pos           (cols  0-2): R
-        //   R_lidar2enu     (cols 23-25): -R * hat(s.pos)  (right perturbation, IKFoM boxminus)
-        //   t_lidar2enu     (cols 26-28): I
-        M3D R_Le  = s.R_lidar2enu.toRotationMatrix();
-        M3D hat_p;
-        hat_p << SKEW_SYM_MATRX(s.pos);
-        M3D Rhat = R_Le * hat_p;       // R * hat(s.pos)
-        V3D innovation = Measures.rtk_pos - (R_Le * s.pos + s.t_lidar2enu);
-
-        for (int k = 0; k < rtk_repeat_n; k++)
-        {
-            int r = orig_rows + k * 3;
-            // X row
-            ekfom_data.h_x.block<1,3>(r,   0)  = R_Le.row(0);
-            if (lidar_enu_est_en)
-                ekfom_data.h_x.block<1,3>(r,  23) = -Rhat.row(0);
-            ekfom_data.h_x(r,   26) = 1.0;
-            ekfom_data.h(r)         = innovation(0);
-            // Y row
-            ekfom_data.h_x.block<1,3>(r+1, 0)  = R_Le.row(1);
-            if (lidar_enu_est_en)
-                ekfom_data.h_x.block<1,3>(r+1,23) = -Rhat.row(1);
-            ekfom_data.h_x(r+1, 27) = 1.0;
-            ekfom_data.h(r+1)       = innovation(1);
-            // Z row
-            ekfom_data.h_x.block<1,3>(r+2, 0)  = R_Le.row(2);
-            if (lidar_enu_est_en)
-                ekfom_data.h_x.block<1,3>(r+2,23) = -Rhat.row(2);
-            ekfom_data.h_x(r+2, 28) = 1.0;
-            ekfom_data.h(r+2)       = innovation(2);
-        }
-    }
-
-    /*** Append RTK yaw residual row (constrains R_lidar2enu yaw DOF) ***/
-    if (rtk_yaw_en && Measures.has_rtk_yaw && rtk_mode_en && rtk_fuse_en)
-    {
-        constexpr int SD = 29;
-        int orig_rows_all = ekfom_data.h_x.rows();   // 已有 LiDAR + RTK pos 行
-        int new_rows      = orig_rows_all + 1;
-
-        MatrixXd h_x_prev = ekfom_data.h_x;
-        VectorXd h_prev   = ekfom_data.h;
-        ekfom_data.h_x = MatrixXd::Zero(new_rows, SD);
-        ekfom_data.h.resize(new_rows);
-        ekfom_data.h_x.topRows(orig_rows_all) = h_x_prev;
-        ekfom_data.h.head(orig_rows_all)      = h_prev;
-
-        // 预测航向: psi = atan2(M(1,0), M(0,0)), M = R_lidar2enu * s.rot
-        M3D M_Le = s.R_lidar2enu.toRotationMatrix() * s.rot.toRotationMatrix();
-        double psi_pred = std::atan2(M_Le(1,0), M_Le(0,0));
-        double dyaw = Measures.rtk_yaw - psi_pred;
-        // 最短路径环绕
-        if (dyaw >  M_PI) dyaw -= 2 * M_PI;
-        if (dyaw < -M_PI) dyaw += 2 * M_PI;
-        int r = new_rows - 1;
-        ekfom_data.h(r) = dyaw;
-
-        // 雅可比: 1×29, 简化为绕 body Z 的 yaw 方向
-        //   ∂yaw/∂(s.rot δφ)        ≈ Jr^-1 投影到 Z 轴 → 小姿态下 [0, 1, 0]
-        //   ∂yaw/∂(R_lidar2enu δθ)  ≈ Jr^-1 投影到 Z 轴 → 小姿态下 [0, 1, 0]
-        // t_lidar2enu 不影响 yaw, 其它状态列保持零
-        if (lidar_enu_est_en)
-            ekfom_data.h_x(r, 25) = 1.0;   // R_lidar2enu 第 3 个分量 (Z)
-        ekfom_data.h_x(r, 4) = 1.0;        // s.rot 第 2 个分量 (Y) — 经 Jr^-1 后对应到 yaw
-        // 注: 上述 [0,1,0]/[0,1,0] 在 roll/pitch=0 时为最佳近似; 倾角大时用完整
-        // Jr^-1 链式法可改进。已留 TODO 在 PR 描述中。
     }
 
     solve_time += omp_get_wtime() - solve_start_;
@@ -1061,6 +1100,7 @@ int main(int argc, char** argv)
     nh.param<string>("rtk/rtk_yaw_topic",     rtk_yaw_topic,     "/rtk_yaw");
     nh.param<bool>  ("rtk/yaw_from_east_cw",  yaw_from_east_cw,  true);
     nh.param<double>("rtk/rtk_yaw_cov",       rtk_yaw_cov,       0.05);
+    nh.param<double>("rtk/rtk_pos_cov",       rtk_pos_cov,       0.01);
     nh.param<bool>  ("rtk/lidar_enu_est_en",  lidar_enu_est_en,  true);
     {
         vector<double> init_R_vec, init_T_vec;
@@ -1151,16 +1191,17 @@ int main(int argc, char** argv)
                  rtk_fuse_en ? "FUSION (RTK residuals in IEKF)" : "LOCALIZATION (RTK state override)",
                  rtk_topic.c_str());
         if (rtk_fuse_en)
-            ROS_INFO("RTK fusion: repeat_n=%d (equiv R_rtk = R_lidar/%.1f)",
-                     rtk_repeat_n, (double)rtk_repeat_n);
+            ROS_INFO("RTK fusion (MODE 3): pos_cov=%.3f m², independent EKF correction after LiDAR IEKF",
+                     rtk_pos_cov);
+        if (rtk_yaw_en && rtk_fuse_en)
 
         // MODE 3 才允许 yaw 融合; yaw 用于约束 R_lidar2enu
         if (rtk_yaw_en && rtk_fuse_en)
         {
             sub_rtk_yaw = nh.subscribe<nav_msgs::Odometry>(rtk_yaw_topic, 200000, rtk_yaw_cbk);
-            ROS_INFO("RTK yaw fusion: subscribing to %s (yaw_from_east_cw=%s, cov=%.3f rad²)",
-                     rtk_yaw_topic.c_str(),
-                     yaw_from_east_cw ? "true" : "false", rtk_yaw_cov);
+            ROS_INFO("RTK yaw correction (MODE 3): subscribing to %s, cov=%.3f rad², yaw_from_east_cw=%s",
+                     rtk_yaw_topic.c_str(), rtk_yaw_cov,
+                     yaw_from_east_cw ? "true" : "false");
         }
         else if (rtk_yaw_en && !rtk_fuse_en)
         {
@@ -1332,7 +1373,7 @@ int main(int argc, char** argv)
             else
             {
                 /**** Mode 1: Original FAST_LIO   or   Mode 3: RTK Fusion ****/
-                /*** (Mode 3: h_share_model appends RTK rows when Measures.has_rtk) ***/
+                /*** (Mode 3: apply_rtk/yaw_correction runs after LiDAR IEKF converges) ***/
                 double t0,t1,t2,t3,t4,t5,match_start, solve_start, svd_time;
 
                 match_time = 0;
@@ -1415,6 +1456,13 @@ int main(int argc, char** argv)
                 double t_update_start = omp_get_wtime();
                 double solve_H_time = 0;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+
+                /*** MODE 3: 独立 EKF 校正 — RTK 位置 + 外部航向 ***/
+                if (rtk_mode_en && rtk_fuse_en && Measures.has_rtk)
+                    apply_rtk_correction(kf, Measures, rtk_pos_cov, lidar_enu_est_en);
+                if (rtk_yaw_en && Measures.has_rtk_yaw && rtk_mode_en && rtk_fuse_en)
+                    apply_yaw_correction(kf, Measures, rtk_yaw_cov, lidar_enu_est_en);
+
                 state_point = kf.get_x();
                 euler_cur = SO3ToEuler(state_point.rot);
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
