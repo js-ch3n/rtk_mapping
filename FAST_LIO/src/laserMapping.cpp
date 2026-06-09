@@ -136,6 +136,20 @@ V3D    prev_rtk_pos = Zero3d;
 M3D    prev_rtk_rot = Eye3d;
 bool   rtk_first_scan = true;
 
+/*** RTK heading fusion (constrains R_lidar2enu yaw DOF) ***/
+bool   rtk_yaw_en            = false;   // 启用 /rtk_yaw 外部航向作为 IEKF 残差
+string rtk_yaw_topic         = "/rtk_yaw";
+bool   yaw_from_east_cw      = true;    // 外部源 CW from East (与 gnss_conversion_4dof_node 默认一致)
+deque<pair<double,double>> rtk_yaw_buffer;  // (stamp, yaw_CCW_from_East [rad])
+double last_timestamp_rtk_yaw = -1.0;
+double rtk_yaw_cov           = 0.05;    // 航向残差协方差 (rad²), ~0.22 rad std
+
+/*** R_lidar2enu / t_lidar2enu 在线估计 ***/
+bool   lidar_enu_est_en      = true;    // false=冻结刚体变换 (雅可比对应列清零)
+M3D    init_R_lidar2enu      = Eye3d;   // 启动初值, 可从 yaml 覆盖
+V3D    init_t_lidar2enu      = Zero3d;  // 启动初值
+bool   use_first_rtk_as_origin = false; // true=把 t_lidar2enu 初始化为 -first_rtk_pos
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -385,6 +399,23 @@ void rtk_odom_cbk(const nav_msgs::Odometry::ConstPtr &msg)
     mtx_buffer.unlock();
 }
 
+void rtk_yaw_cbk(const nav_msgs::Odometry::ConstPtr &msg)
+{
+    // 从四元数取 yaw (返回 ROS 标准 CCW from East, atan2(E,N))
+    double yaw_enu = tf::getYaw(msg->pose.pose.orientation);
+    // 外部源约定: CW from East 时取负变 CCW
+    if (yaw_from_east_cw) yaw_enu = -yaw_enu;
+
+    mtx_buffer.lock();
+    last_timestamp_rtk_yaw = msg->header.stamp.toSec();
+    rtk_yaw_buffer.emplace_back(last_timestamp_rtk_yaw, yaw_enu);
+    if (rtk_yaw_buffer.size() > 2000)
+    {
+        rtk_yaw_buffer.pop_front();
+    }
+    mtx_buffer.unlock();
+}
+
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
@@ -513,8 +544,51 @@ bool sync_packages(MeasureGroup &meas)
             set_pose(before);
         }
         meas.has_rtk = true;
+
+        // use_first_rtk_as_origin: 首个 RTK 把 t_lidar2enu 初始化为 -rtk_pos
+        if (use_first_rtk_as_origin && rtk_first_scan)
+        {
+            state_ikfom x = kf.get_x();
+            x.t_lidar2enu = -meas.rtk_pos;
+            kf.change_x(x);
+            // 收紧协方差
+            auto P = kf.get_P();
+            P(26,26) = P(27,27) = P(28,28) = 0.01;
+            kf.change_P(P);
+            rtk_first_scan = false;
+            ROS_INFO("First RTK as origin: t_lidar2enu = [%.3f, %.3f, %.3f]",
+                     -meas.rtk_pos(0), -meas.rtk_pos(1), -meas.rtk_pos(2));
+        }
     }
     skip_rtk_sync:
+
+    /*** sync RTK yaw (external heading) ***/
+    meas.has_rtk_yaw = false;
+    if (rtk_yaw_en && rtk_yaw_buffer.size() >= 2)
+    {
+        // 弹出过老条目
+        while (rtk_yaw_buffer.size() >= 2 &&
+               rtk_yaw_buffer[1].first < meas.lidar_beg_time)
+            rtk_yaw_buffer.pop_front();
+
+        if (rtk_yaw_buffer.size() >= 2 &&
+            rtk_yaw_buffer.front().first <= lidar_end_time &&
+            rtk_yaw_buffer[1].first  >  lidar_end_time)
+        {
+            double t1 = rtk_yaw_buffer[0].first;
+            double t2 = rtk_yaw_buffer[1].first;
+            double y1 = rtk_yaw_buffer[0].second;
+            double y2 = rtk_yaw_buffer[1].second;
+            double ratio = (lidar_end_time - t1) / (t2 - t1);
+            ratio = std::max(0.0, std::min(1.0, ratio));
+            // 最短路径插值 (绕 ±π 环绕)
+            double dy = y2 - y1;
+            if (dy >  M_PI) dy -= 2 * M_PI;
+            if (dy < -M_PI) dy += 2 * M_PI;
+            meas.rtk_yaw     = y1 + ratio * dy;
+            meas.has_rtk_yaw = true;
+        }
+    }
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
@@ -816,7 +890,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     double solve_start_  = omp_get_wtime();
     
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
+    // State dim is 29 (3+3+3+3+3+3+3+2+3+3). LiDAR rows only fill cols 0-11; rest stay zero.
+    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 29);
     ekfom_data.h.resize(effct_feat_num);
 
     for (int i = 0; i < effct_feat_num; i++)
@@ -845,6 +920,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         {
             ekfom_data.h_x.block<1, 12>(i,0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
         }
+        // cols 12-28 (vel, bg, ba, grav, R_lidar2enu, t_lidar2enu) are zero by MatrixXd::Zero
 
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
@@ -857,33 +933,83 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         int rtk_rows  = rtk_repeat_n * 3;  // X,Y,Z repeated N times
 
         // Copy existing LiDAR Jacobian and residuals into expanded matrices
-        MatrixXd h_x_lidar = ekfom_data.h_x;  // (orig_rows × 12)
+        MatrixXd h_x_lidar = ekfom_data.h_x;  // (orig_rows × 29)
         VectorXd h_lidar   = ekfom_data.h;    // (orig_rows × 1)
 
-        ekfom_data.h_x = MatrixXd::Zero(orig_rows + rtk_rows, 12);
+        ekfom_data.h_x = MatrixXd::Zero(orig_rows + rtk_rows, 29);
         ekfom_data.h.resize(orig_rows + rtk_rows);
 
         ekfom_data.h_x.topRows(orig_rows) = h_x_lidar;
         ekfom_data.h.head(orig_rows)      = h_lidar;
 
-        // RTK innovation: z_rtk - h_rtk(x) = rtk_pos - state.pos
-        V3D innovation = Measures.rtk_pos - s.pos;
+        // RTK measurement: predicted = R_lidar2enu * s.pos + t_lidar2enu
+        // Jacobian w.r.t.:
+        //   s.pos           (cols  0-2): R
+        //   R_lidar2enu     (cols 23-25): -R * hat(s.pos)  (right perturbation, IKFoM boxminus)
+        //   t_lidar2enu     (cols 26-28): I
+        M3D R_Le  = s.R_lidar2enu.toRotationMatrix();
+        M3D hat_p;
+        hat_p << SKEW_SYM_MATRX(s.pos);
+        M3D Rhat = R_Le * hat_p;       // R * hat(s.pos)
+        V3D innovation = Measures.rtk_pos - (R_Le * s.pos + s.t_lidar2enu);
 
-        // Fill repeated RTK position rows
-        // Each repetition = 3 rows (X, Y, Z) with Jacobian = I at pos cols 0-2
         for (int k = 0; k < rtk_repeat_n; k++)
         {
             int r = orig_rows + k * 3;
-            // X: ∂h/∂pos_x = 1, all others 0
-            ekfom_data.h_x(r, 0) = 1.0;
-            ekfom_data.h(r)      = innovation(0);
-            // Y: ∂h/∂pos_y = 1
-            ekfom_data.h_x(r + 1, 1) = 1.0;
-            ekfom_data.h(r + 1)      = innovation(1);
-            // Z: ∂h/∂pos_z = 1
-            ekfom_data.h_x(r + 2, 2) = 1.0;
-            ekfom_data.h(r + 2)      = innovation(2);
+            // X row
+            ekfom_data.h_x.block<1,3>(r,   0)  = R_Le.row(0);
+            if (lidar_enu_est_en)
+                ekfom_data.h_x.block<1,3>(r,  23) = -Rhat.row(0);
+            ekfom_data.h_x(r,   26) = 1.0;
+            ekfom_data.h(r)         = innovation(0);
+            // Y row
+            ekfom_data.h_x.block<1,3>(r+1, 0)  = R_Le.row(1);
+            if (lidar_enu_est_en)
+                ekfom_data.h_x.block<1,3>(r+1,23) = -Rhat.row(1);
+            ekfom_data.h_x(r+1, 27) = 1.0;
+            ekfom_data.h(r+1)       = innovation(1);
+            // Z row
+            ekfom_data.h_x.block<1,3>(r+2, 0)  = R_Le.row(2);
+            if (lidar_enu_est_en)
+                ekfom_data.h_x.block<1,3>(r+2,23) = -Rhat.row(2);
+            ekfom_data.h_x(r+2, 28) = 1.0;
+            ekfom_data.h(r+2)       = innovation(2);
         }
+    }
+
+    /*** Append RTK yaw residual row (constrains R_lidar2enu yaw DOF) ***/
+    if (rtk_yaw_en && Measures.has_rtk_yaw && rtk_mode_en && rtk_fuse_en)
+    {
+        constexpr int SD = 29;
+        int orig_rows_all = ekfom_data.h_x.rows();   // 已有 LiDAR + RTK pos 行
+        int new_rows      = orig_rows_all + 1;
+
+        MatrixXd h_x_prev = ekfom_data.h_x;
+        VectorXd h_prev   = ekfom_data.h;
+        ekfom_data.h_x = MatrixXd::Zero(new_rows, SD);
+        ekfom_data.h.resize(new_rows);
+        ekfom_data.h_x.topRows(orig_rows_all) = h_x_prev;
+        ekfom_data.h.head(orig_rows_all)      = h_prev;
+
+        // 预测航向: psi = atan2(M(1,0), M(0,0)), M = R_lidar2enu * s.rot
+        M3D M_Le = s.R_lidar2enu.toRotationMatrix() * s.rot.toRotationMatrix();
+        double psi_pred = std::atan2(M_Le(1,0), M_Le(0,0));
+        double dyaw = Measures.rtk_yaw - psi_pred;
+        // 最短路径环绕
+        if (dyaw >  M_PI) dyaw -= 2 * M_PI;
+        if (dyaw < -M_PI) dyaw += 2 * M_PI;
+        int r = new_rows - 1;
+        ekfom_data.h(r) = dyaw;
+
+        // 雅可比: 1×29, 简化为绕 body Z 的 yaw 方向
+        //   ∂yaw/∂(s.rot δφ)        ≈ Jr^-1 投影到 Z 轴 → 小姿态下 [0, 1, 0]
+        //   ∂yaw/∂(R_lidar2enu δθ)  ≈ Jr^-1 投影到 Z 轴 → 小姿态下 [0, 1, 0]
+        // t_lidar2enu 不影响 yaw, 其它状态列保持零
+        if (lidar_enu_est_en)
+            ekfom_data.h_x(r, 25) = 1.0;   // R_lidar2enu 第 3 个分量 (Z)
+        ekfom_data.h_x(r, 4) = 1.0;        // s.rot 第 2 个分量 (Y) — 经 Jr^-1 后对应到 yaw
+        // 注: 上述 [0,1,0]/[0,1,0] 在 roll/pitch=0 时为最佳近似; 倾角大时用完整
+        // Jr^-1 链式法可改进。已留 TODO 在 PR 描述中。
     }
 
     solve_time += omp_get_wtime() - solve_start_;
@@ -931,6 +1057,36 @@ int main(int argc, char** argv)
     nh.param<bool>("rtk/rtk_fuse_en", rtk_fuse_en, false);
     nh.param<int> ("rtk/rtk_repeat_n", rtk_repeat_n, 5);
     nh.param<string>("rtk/rtk_topic", rtk_topic, "/rtk_odom");
+    nh.param<bool>  ("rtk/rtk_yaw_en",        rtk_yaw_en,        false);
+    nh.param<string>("rtk/rtk_yaw_topic",     rtk_yaw_topic,     "/rtk_yaw");
+    nh.param<bool>  ("rtk/yaw_from_east_cw",  yaw_from_east_cw,  true);
+    nh.param<double>("rtk/rtk_yaw_cov",       rtk_yaw_cov,       0.05);
+    nh.param<bool>  ("rtk/lidar_enu_est_en",  lidar_enu_est_en,  true);
+    {
+        vector<double> init_R_vec, init_T_vec;
+        nh.param<vector<double>>("rtk/init_R_lidar2enu", init_R_vec, vector<double>());
+        if (init_R_vec.size() == 9)
+            init_R_lidar2enu << MAT_FROM_ARRAY(init_R_vec);
+        nh.param<vector<double>>("rtk/init_t_lidar2enu", init_T_vec, vector<double>());
+        if (init_T_vec.size() == 3)
+            init_t_lidar2enu << init_T_vec[0], init_T_vec[1], init_T_vec[2];
+    }
+    nh.param<bool>  ("rtk/use_first_rtk_as_origin", use_first_rtk_as_origin, false);
+
+    // Mode 2 不兼容 R_lidar2enu 在线估计: 警告并降级
+    if (rtk_mode_en && !rtk_fuse_en)
+    {
+        if (lidar_enu_est_en)
+        {
+            ROS_WARN("MODE 2 (rtk_fuse_en=false) 不在线估计 R/t; lidar_enu_est_en 强制为 false");
+            lidar_enu_est_en = false;
+        }
+        if (rtk_yaw_en)
+        {
+            ROS_WARN("MODE 2 (rtk_fuse_en=false) 与 rtk_yaw_en 不兼容; 关闭 yaw 融合");
+            rtk_yaw_en = false;
+        }
+    }
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -963,8 +1119,8 @@ int main(int argc, char** argv)
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
     p_imu->lidar_type = lidar_type;
-    double epsi[23] = {0.001};
-    fill(epsi, epsi+23, 0.001);
+    double epsi[29] = {0.001};
+    fill(epsi, epsi+29, 0.001);
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
@@ -987,6 +1143,7 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
     ros::Subscriber sub_rtk;
+    ros::Subscriber sub_rtk_yaw;
     if (rtk_mode_en)
     {
         sub_rtk = nh.subscribe<nav_msgs::Odometry>(rtk_topic, 200000, rtk_odom_cbk);
@@ -996,6 +1153,27 @@ int main(int argc, char** argv)
         if (rtk_fuse_en)
             ROS_INFO("RTK fusion: repeat_n=%d (equiv R_rtk = R_lidar/%.1f)",
                      rtk_repeat_n, (double)rtk_repeat_n);
+
+        // MODE 3 才允许 yaw 融合; yaw 用于约束 R_lidar2enu
+        if (rtk_yaw_en && rtk_fuse_en)
+        {
+            sub_rtk_yaw = nh.subscribe<nav_msgs::Odometry>(rtk_yaw_topic, 200000, rtk_yaw_cbk);
+            ROS_INFO("RTK yaw fusion: subscribing to %s (yaw_from_east_cw=%s, cov=%.3f rad²)",
+                     rtk_yaw_topic.c_str(),
+                     yaw_from_east_cw ? "true" : "false", rtk_yaw_cov);
+        }
+        else if (rtk_yaw_en && !rtk_fuse_en)
+        {
+            ROS_WARN("rtk_yaw_en=true 但 rtk_fuse_en=false; yaw 融合无效, 关闭");
+            rtk_yaw_en = false;
+        }
+
+        // 把刚体变换初值传给 IMU 处理模块
+        p_imu->set_lidar_enu_init(init_R_lidar2enu, init_t_lidar2enu);
+        if (use_first_rtk_as_origin)
+            ROS_INFO("RTK first-fix-as-origin enabled: t_lidar2enu 将被第一个 RTK 覆盖");
+        if (lidar_enu_est_en)
+            ROS_INFO("R_lidar2enu / t_lidar2enu 在线估计已启用 (state_ikfom 中的状态量)");
     }
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);

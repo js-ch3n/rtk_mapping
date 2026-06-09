@@ -18,7 +18,13 @@ MTK_BUILD_MANIFOLD(state_ikfom,
 ((vect3, bg))
 ((vect3, ba))
 ((S2, grav))
+((SO3, R_lidar2enu))  // 23-25  LiDAR initial frame -> ENU rotation (MODE 3)
+((vect3, t_lidar2enu)) // 26-28  LiDAR initial frame origin in ENU (MODE 3)
 );
+
+// Compile-time check: state DOF must be 3+3+3+3+3+3+3+2+3+3 = 29
+static_assert(state_ikfom::DOF == 29,
+              "state_ikfom internal DOF must be 29 after adding R_lidar2enu/t_lidar2enu");
 
 MTK_BUILD_MANIFOLD(input_ikfom,
 ((vect3, acc))
@@ -44,23 +50,32 @@ MTK::get_cov<process_noise_ikfom>::type process_noise_cov()
 
 //double L_offset_to_I[3] = {0.04165, 0.02326, -0.0284}; // Avia 
 //vect3 Lidar_offset_to_IMU(L_offset_to_I, 3);
-Eigen::Matrix<double, 24, 1> get_f(state_ikfom &s, const input_ikfom &in)
+Eigen::Matrix<double, 30, 1> get_f(state_ikfom &s, const input_ikfom &in)
 {
-	Eigen::Matrix<double, 24, 1> res = Eigen::Matrix<double, 24, 1>::Zero();
+	// m = state::DIM = 30 (10 manifold entries × 3). Rows 6..8, 9..11, 12..14, 15..17,
+	// 18..20, 21..23, 24..26, 27..29 are all zero (static state or unused).
+	Eigen::Matrix<double, 30, 1> res = Eigen::Matrix<double, 30, 1>::Zero();
 	vect3 omega;
 	in.gyro.boxminus(omega, s.bg);
-	vect3 a_inertial = s.rot * (in.acc-s.ba); 
+	vect3 a_inertial = s.rot * (in.acc-s.ba);
 	for(int i = 0; i < 3; i++ ){
 		res(i) = s.vel[i];
-		res(i + 3) =  omega[i]; 
-		res(i + 12) = a_inertial[i] + s.grav[i]; 
+		res(i + 3) =  omega[i];
+		res(i + 12) = a_inertial[i] + s.grav[i];
 	}
 	return res;
 }
 
-Eigen::Matrix<double, 24, 23> df_dx(state_ikfom &s, const input_ikfom &in)
+Eigen::Matrix<double, 30, 29> df_dx(state_ikfom &s, const input_ikfom &in)
 {
-	Eigen::Matrix<double, 24, 23> cov = Eigen::Matrix<double, 24, 23>::Zero();
+	// m = state::DIM = 30, n = state::DOF = 29
+	// Rows 0-2:   pos_dot  = vel
+	// Rows 3-5:   rot_dot  = omega
+	// Rows 6-11:  reserved (zero)
+	// Rows 12-14: vel_dot  = a_inertial + grav
+	// Rows 15-29: zero (offset_R_L_I, offset_T_L_I, bg, ba, grav, R_lidar2enu, t_lidar2enu 均为静态)
+	// Cols 23-28: R_lidar2enu / t_lidar2enu (static) — no derivative, left at zero
+	Eigen::Matrix<double, 30, 29> cov = Eigen::Matrix<double, 30, 29>::Zero();
 	cov.template block<3, 3>(0, 12) = Eigen::Matrix3d::Identity();
 	vect3 acc_;
 	in.acc.boxminus(acc_, s.ba);
@@ -77,9 +92,9 @@ Eigen::Matrix<double, 24, 23> df_dx(state_ikfom &s, const input_ikfom &in)
 }
 
 
-Eigen::Matrix<double, 24, 12> df_dw(state_ikfom &s, const input_ikfom &in)
+Eigen::Matrix<double, 30, 12> df_dw(state_ikfom &s, const input_ikfom &in)
 {
-	Eigen::Matrix<double, 24, 12> cov = Eigen::Matrix<double, 24, 12>::Zero();
+	Eigen::Matrix<double, 30, 12> cov = Eigen::Matrix<double, 30, 12>::Zero();
 	cov.template block<3, 3>(12, 3) = -s.rot.toRotationMatrix();
 	cov.template block<3, 3>(3, 0) = -Eigen::Matrix3d::Identity();
 	cov.template block<3, 3>(15, 6) = Eigen::Matrix3d::Identity();

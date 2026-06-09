@@ -68,6 +68,10 @@ struct MeasureGroup     // Lidar data and imu dates for the curent process
     bool has_rtk = false;
     V3D  rtk_pos = Zero3d;
     M3D  rtk_rot = Eye3d;
+
+    // External heading synced to this scan (MODE 3 yaw fusion, constrains R_lidar2enu)
+    bool   has_rtk_yaw = false;
+    double rtk_yaw     = 0.0;   // CCW from East [rad]
 };
 
 struct StatesGroup

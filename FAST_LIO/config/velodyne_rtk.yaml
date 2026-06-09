@@ -30,6 +30,19 @@ rtk:
     rtk_fuse_en: false      # true=RTK参与IEKF残差融合, false=RTK直接覆盖定位(legacy)
     rtk_repeat_n: 5         # RTK信任度:重复行数N=R_lidar/R_rtk (>1=更信RTK, 1=等权)
 
+    # MODE 3 扩展: 外部航向融合 + 刚体变换在线估计
+    rtk_yaw_en: true                       # 启用 /rtk_yaw 外部航向约束 R_lidar2enu yaw
+    rtk_yaw_topic: "/rtk_yaw"              # nav_msgs::Odometry, 取 pose.orientation yaw
+    yaw_from_east_cw: true                 # 源约定: 顺时针从东; 内部转 CCW from East
+    rtk_yaw_cov: 0.05                      # 航向残差协方差 (rad²)
+
+    lidar_enu_est_en: true                 # 在线估计 R_lidar2enu / t_lidar2enu
+    init_R_lidar2enu: [1, 0, 0,
+                       0, 1, 0,
+                       0, 0, 1]            # 启动初值, 行主序
+    init_t_lidar2enu: [0, 0, 0]            # 启动初值 (m)
+    use_first_rtk_as_origin: false         # true=把首个 RTK 当作 ENU 原点
+
 publish:
     path_en:  true
     scan_publish_en:  true

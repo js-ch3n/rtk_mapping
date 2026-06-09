@@ -12,7 +12,7 @@
  * This node solves the problem by ingesting an external yaw signal:
  *
  *   Input 1:  /rtk_fix   (sensor_msgs::NavSatFix)  — RTK lat/lon/alt
- *   Input 2:  /rtk_yaw   (std_msgs::Float64)       — vehicle yaw [rad]
+ *   Input 2:  /rtk_yaw   (nav_msgs::Odometry)       — vehicle yaw from pose.orientation
  *              Convention: clockwise from East, positive clockwise when
  *              viewed top-down (ENU frame).  See param yaw_from_east_cw.
  *   Output:   /rtk_odom  (nav_msgs::Odometry)       — 4-DOF 零起点里程计
@@ -30,7 +30,6 @@
 #include <ros/ros.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <nav_msgs/Odometry.h>
-#include <std_msgs/Float64.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <Eigen/Core>
@@ -95,12 +94,16 @@ inline V3D ecef_to_enu(const V3D &delta_ecef, double ref_lat, double ref_lon)
 }
 
 // ─── Yaw callback ─────────────────────────────────────────────────────
-void yaw_callback(const std_msgs::Float64::ConstPtr &msg)
+void yaw_callback(const nav_msgs::Odometry::ConstPtr &msg)
 {
+    // Extract yaw (rotation about Z, ENU Up) from pose quaternion.
+    // ROS standard quaternion encodes CCW from East (right-hand rule with Z up).
+    double yaw_enu = tf::getYaw(msg->pose.pose.orientation);
+
     if (yaw_from_east_cw)
-        latest_yaw = -msg->data;   // clockwise from East → standard CCW
+        latest_yaw = -yaw_enu;   // source is CW from East → negate to CCW
     else
-        latest_yaw = msg->data;
+        latest_yaw = yaw_enu;
     yaw_received = true;
 }
 
@@ -216,7 +219,7 @@ int main(int argc, char **argv)
 
     ros::NodeHandle nh_public;
     ros::Subscriber sub_fix = nh_public.subscribe<sensor_msgs::NavSatFix>(input_fix_topic, 1000, fix_callback);
-    ros::Subscriber sub_yaw = nh_public.subscribe<std_msgs::Float64>(input_yaw_topic, 100, yaw_callback);
+    ros::Subscriber sub_yaw = nh_public.subscribe<nav_msgs::Odometry>(input_yaw_topic, 100, yaw_callback);
 
     ros::spin();
     return 0;

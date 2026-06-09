@@ -3,7 +3,7 @@
 
 # ── I/O ────────────────────────────────────────────────────────────────
 input_fix_topic: "/rtk_fix"         # sensor_msgs::NavSatFix
-input_yaw_topic: "/rtk_yaw"         # std_msgs::Float64 [rad]
+input_yaw_topic: "/rtk_yaw"         # nav_msgs::Odometry (yaw from pose.orientation, [rad])
 output_odom_topic: "/rtk_odom"      # nav_msgs::Odometry
 
 # ── Frame IDs ──────────────────────────────────────────────────────────

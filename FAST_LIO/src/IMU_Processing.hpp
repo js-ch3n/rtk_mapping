@@ -45,6 +45,7 @@ class ImuProcess
   void set_extrinsic(const V3D &transl, const M3D &rot);
   void set_extrinsic(const V3D &transl);
   void set_extrinsic(const MD(4,4) &T);
+  void set_lidar_enu_init(const M3D &R, const V3D &t);  // 初值, 用于 IMU_init 写进 state_ikfom
   void set_gyr_cov(const V3D &scaler);
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
@@ -73,6 +74,8 @@ class ImuProcess
   vector<M3D>    v_rot_pcl_;
   M3D Lidar_R_wrt_IMU;
   V3D Lidar_T_wrt_IMU;
+  M3D init_R_lidar2enu_;   // MODE 3: LiDAR 初始系 -> ENU 旋转初值
+  V3D init_t_lidar2enu_;   // MODE 3: LiDAR 初始系原点在 ENU 下位置初值
   V3D mean_acc;
   V3D mean_gyr;
   V3D angvel_last;
@@ -98,6 +101,8 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
+  init_R_lidar2enu_ = Eye3d;
+  init_t_lidar2enu_ = Zero3d;
   last_imu_.reset(new sensor_msgs::Imu());
 }
 
@@ -134,6 +139,12 @@ void ImuProcess::set_extrinsic(const V3D &transl, const M3D &rot)
 {
   Lidar_T_wrt_IMU = transl;
   Lidar_R_wrt_IMU = rot;
+}
+
+void ImuProcess::set_lidar_enu_init(const M3D &R, const V3D &t)
+{
+  init_R_lidar2enu_ = R;
+  init_t_lidar2enu_ = t;
 }
 
 void ImuProcess::set_gyr_cov(const V3D &scaler)
@@ -199,6 +210,8 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
+  init_state.R_lidar2enu  = SO3(init_R_lidar2enu_);
+  init_state.t_lidar2enu  = init_t_lidar2enu_;
   kf_state.change_x(init_state);
 
   esekfom::esekf<state_ikfom, 12, input_ikfom>::cov init_P = kf_state.get_P();
@@ -207,7 +220,10 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
   init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
-  init_P(21,21) = init_P(22,22) = 0.00001; 
+  init_P(21,21) = init_P(22,22) = 0.00001;
+  // MODE 3 新增刚体变换初值协方差 (~0.1 rad, 1 m 初值不确定度)
+  init_P(23,23) = init_P(24,24) = init_P(25,25) = 0.01;
+  init_P(26,26) = init_P(27,27) = init_P(28,28) = 1.0;
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
 
