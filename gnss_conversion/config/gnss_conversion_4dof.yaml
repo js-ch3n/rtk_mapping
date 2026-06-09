@@ -1,0 +1,31 @@
+# 4-DOF GNSS Conversion Configuration (external yaw)
+# Converts RTK NavSatFix + external yaw into zero-based 4-DOF odometry.
+
+# ── I/O ────────────────────────────────────────────────────────────────
+input_fix_topic: "/rtk_fix"         # sensor_msgs::NavSatFix
+input_yaw_topic: "/rtk_yaw"         # std_msgs::Float64 [rad]
+output_odom_topic: "/rtk_odom"      # nav_msgs::Odometry
+
+# ── Frame IDs ──────────────────────────────────────────────────────────
+world_frame_id: "odom"
+child_frame_id: "base_link"
+
+# ── TF ─────────────────────────────────────────────────────────────────
+publish_tf: true
+
+# ── Jump Detection ─────────────────────────────────────────────────────
+reset_on_jump: true
+jump_threshold: 50.0
+
+# ── Fix Quality ────────────────────────────────────────────────────────
+fix_status_min: 0       # 0=FIX, 1=SBAS, 2=GBAS
+
+# ── Yaw Convention ─────────────────────────────────────────────────────
+# true:  yaw is clockwise from East (top-down view), will negate to ROS CCW
+# false: yaw is standard CCW from East (ROS convention)
+yaw_from_east_cw: true
+
+# ── Antenna Offset ─────────────────────────────────────────────────────
+antenna_offset_x: 0.0
+antenna_offset_y: 0.0
+antenna_offset_z: 0.0
