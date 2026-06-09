@@ -1,179 +1,166 @@
 # RTK Mapping
 
-LiDAR mapping system that uses **RTK/GNSS positioning** to build globally-aligned point-cloud maps in real time. Built on [FAST_LIO](https://github.com/hku-mars/FAST_LIO) with an added **GNSS conversion** layer that transforms raw `sensor_msgs/NavSatFix` data into zero-based odometry.
-
-## Overview
+LiDAR-inertial mapping with RTK/GNSS absolute positioning. Built on [FAST_LIO](https://github.com/hku-mars/FAST_LIO) with a GNSS conversion layer that transforms raw `NavSatFix` into zero-based ENU odometry.
 
 ```
-GNSS NavSatFix ──→ gnss_conversion ──→ /rtk_odom ──→ FAST_LIO (RTK mode)
-(lat/lon/alt)     (WGS84→ENU,         (Odometry    (LiDAR mapping with
-                   zero-origin)        from 0,0,0)   absolute position)
+GNSS NavSatFix ──→ gnss_conversion ──→ /rtk/odom ──→ FAST_LIO
+(lat/lon/alt)     WGS84→ECEF→ENU      Odometry     LiDAR mapping
+                  zero-origin                       w/ absolute pose
 ```
 
-- **`FAST_LIO`** — LiDAR-inertial odometry supporting **three RTK operating modes** (see below). Modified from [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO).
-- **`gnss_conversion`** — Converts raw GNSS fixes (`sensor_msgs/NavSatFix`) into local ENU odometry (`nav_msgs/Odometry`) relative to the first received fix. Handles WGS84→ECEF→ENU transformation, heading-from-motion, antenna offset, jump detection, and origin reset.
+## Packages
 
-> **Note:** `gnss_conversion` currently provides **3-DOF position only** (ENU x, y, z). The orientation in the output Odometry is a yaw estimate computed from consecutive position deltas — there is **no pitch/roll from GNSS**. Downstream, FAST_LIO Mode 2 uses this yaw to set full 6-DOF pose; Mode 3 uses position only, letting LiDAR-IMU handle orientation.
-
-## Demo
-
-**RTK Fusion mode (Mode 3) — stable localization with LiDAR point-cloud mapping:**
-
-
-![RTK Fusion Demo](docs/RTK_MAPPING.gif)
-
-*Mode 3 — tested in a degraded tunnel scenario. Ground-truth trajectory was converted to simulated RTK 6-DOF measurements for fusion. With RTK fusion enabled, localization remains stable throughout; without fusion, LiDAR-IMU odometry degrades severely in the feature-sparse tunnel environment.*
-
-
-
-## Requirements
-
-- **ROS Noetic** (catkin workspace)
-- **Eigen3**
-- **PCL ≥ 1.8**
-- **Livox SDK** (for Livox LiDAR; see [Livox-SDK](https://github.com/Livox-SDK/Livox-SDK))
+| Package | Role |
+|---|---|
+| [`FAST_LIO`](FAST_LIO/) | LiDAR-inertial odometry, 3 RTK modes |
+| [`gnss_conversion`](gnss_conversion/) | NavSatFix → ENU odometry |
 
 ## Build
 
 ```bash
-# Clone into your catkin workspace
 cd ~/catkin_ws/src
-git clone --recursive https://github.com/<your-org>/rtk_mapping.git
-cd ..
-
-# Build
-catkin_make
-# or: catkin build
-
-source devel/setup.bash
+git clone --recursive <repo_url> rtk_mapping
+cd .. && catkin_make && source devel/setup.bash
 ```
 
-## FAST_LIO RTK Mapping Modes
+## FAST_LIO RTK Modes
 
-FAST_LIO supports three operating modes for RTK/GNSS integration:
+| Mode | `rtk_mode_en` | `rtk_fuse_en` | Behavior |
+|------|:---:|:---:|---|
+| 1. Original | `false` | — | Pure LiDAR-IMU, no RTK |
+| 2. Localization | `true` | `false` | RTK overrides state each scan, LiDAR matching disabled |
+| 3. Fusion | `true` | `true` | LiDAR IEKF + independent RTK/yaw EKF corrections |
 
-| Mode | Name | `rtk_mode_en` | `rtk_fuse_en` | RTK DOF | Behavior |
-| :---: | --- | :---: | :---: | :---: | --- |
-| **1** | Original FAST_LIO | `false` | — | — | Pure LiDAR-IMU odometry. No RTK subscription. |
-| **2** | RTK Localization | `true` | `false` | **6-DOF** | RTK pose (position + orientation) directly overrides EKF state each scan. LiDAR matching disabled. Full 6-DOF global localization, but trajectory follows RTK noise. |
-| **3** | RTK Fusion | `true` | `true` | **3-DOF** | RTK position only added as measurement residual in IEKF, jointly optimized with LiDAR point-to-plane constraints. Orientation from LiDAR-IMU. Smoother, survives RTK dropout. |
+---
 
+### Mode 3 — RTK Fusion（核心机制）
 
-### Mode 3 tuning: `rtk_repeat_n`
+**目标**：系统可在任意初始姿态下启动，IEKF 在线估计 LiDAR 初始系到 ENU 的刚体变换 `(R_lidar2enu, t_lidar2enu)`，航向由外部 yaw 约束。
 
-| RTK accuracy | Recommended N | Effective R_rtk |
-|-------------|:---:|:---:|
-| 1 cm | 10 | R_lidar / 10 |
-| 2 cm | 3–5 | R_lidar / 3–5 |
-| 5 cm | 1 | R_lidar (equal weight) |
+#### 状态变量
 
-### Mode comparison
+`state_ikfom` 共 29 自由度（DOF），最后 6 个是 MODE 3 新增的：
 
-| | Mode 2 (Override) | Mode 3 (Fusion) |
-|---|---|---|
-| RTK degrees of freedom | **6-DOF** (position + orientation) | **3-DOF** (position only) |
-| Orientation source | RTK (from GNSS heading) | LiDAR-IMU |
-| LiDAR scan-matching | ✗ Disabled | ✓ Full IEKF |
-| RTK role | Replaces state | Measurement residual |
-| Trajectory smoothness | Follows RTK jitter | Smoothed by LiDAR |
-| RTK dropout | Mapping stops | Falls back to LiDAR-only |
-| Drift without RTK | Immediate | LiDAR-IMU maintains |
-| Computational cost | Low | Same as original FAST_LIO |
-
-### Known Issue: Coordinate Frame Misalignment in Mode 3
-
-Mode 3 computes the RTK residual as `rtk_pos − state.pos`, which assumes both vectors live in the same coordinate frame. In practice they do not.
-
-#### 1. Coordinate Frame Definitions
-
-| Frame | Origin | Axes |
-|-------|--------|------|
-| **RTK ENU** | First GNSS fix (antenna position) | X=East, Y=North, Z=Up |
-| **LiDAR `camera_init`** | First LiDAR scan (sensor position) | X=forward, Y=left, Z=up |
-
-The transformation between them is **SE(3)** — a full 6-DOF rigid body displacement (translation from GNSS antenna to LiDAR mounting point, rotation from ENU axes to LiDAR initial heading).
-
-#### 2. Why Mode 2 Is Unaffected
-
-Mode 2 replaces the EKF state with the RTK pose on the very first scan, effectively rebasing the entire mapping pipeline into the RTK ENU frame. Mode 3 preserves the original FAST_LIO coordinate frame (LiDAR `camera_init`), so the two measurements live in different coordinate systems.
-
-#### 3. Impact
-
-When the vehicle starts with a heading significantly different from East (e.g., pointing North), the residual `rtk_pos − state.pos` mixes components from misaligned axes — the East residual bleeds into the North channel and vice versa. This degrades fusion quality and can cause inconsistent EKF updates.
-
-#### 4. Planned Fix: Online SE(2) Alignment
-
-On the first valid RTK fix, record both `rtk_pos₀` and `state.pos₀` to estimate a translation offset. Accumulate motion deltas over the first few seconds to estimate the yaw offset between the two frames:
-
-```text
-θ_offset = median( atan2(Δrtk_y, Δrtk_x) − atan2(Δekf_y, Δekf_x) )
+```
+索引     变量          类型    含义
+ 0-2    pos           vect3   IMU 在 ENU 下的位置
+ 3-5    rot           SO3     IMU → ENU 旋转
+ 6-8    offset_R_L_I  SO3     LiDAR → IMU 旋转外参
+ 9-11   offset_T_L_I  vect3   LiDAR → IMU 平移外参
+12-14   vel           vect3   IMU 速度
+15-17   bg            vect3   陀螺零偏
+18-20   ba            vect3   加速度计零偏
+21-22   grav          S2      重力方向 (2 DOF)
+23-25   R_lidar2enu   SO3     ★ LiDAR 初始系 → ENU 旋转
+26-28   t_lidar2enu   vect3   ★ LiDAR 初始系原点在 ENU
 ```
 
-Then transform all subsequent RTK measurements into the LiDAR frame before computing residuals:
+`R_lidar2enu` / `t_lidar2enu` 为静态状态（IMU 传播导数为零），仅由观测方程驱动。
 
-```text
-rtk_cam = R_z(θ_offset)ᵀ · (rtk_pos − T_offset)
-innovation = rtk_cam − state.pos
+#### 运行流程
+
 ```
+每帧 LiDAR 扫描:
+  │
+  ├─ 1. IMU 前传 + 点云去畸变 (UndistortPcl)
+  │
+  ├─ 2. LiDAR IEKF 迭代 (h_share_model, 12 列, IKFoM 原生)
+  │      └─ 残差: 点到拟合平面的距离
+  │      └─ 雅可比列: pos, rot, offset_R_L_I, offset_T_L_I (共 12 列)
+  │
+  ├─ 3. apply_rtk_correction() — RTK 位置 EKF 校正 (3-DOF)
+  │      观测: z = rtk_pos (ENU 米)
+  │      预测: h(x) = R_lidar2enu · pos + t_lidar2enu
+  │      雅可比 (3×29):
+  │        列 0-2:   R_lidar2enu                 ∂h/∂pos
+  │        列 23-25: -R_lidar2enu · hat(pos)     ∂h/∂R_lidar2enu (SO3 右扰动)
+  │        列 26-28: I₃                           ∂h/∂t_lidar2enu
+  │      噪声: R_rtk = rtk_pos_cov · I₃  (默认 0.01 m²)
+  │
+  ├─ 4. apply_yaw_correction() — 航向 EKF 校正 (1-DOF)
+  │      观测: z = rtk_yaw (CCW from East, rad)
+  │      预测: psi = atan2(M(1,0), M(0,0)),  M = R_lidar2enu · rot
+  │      雅可比 (1×29): 完整解析链式法则 ∂atan2/∂(rot, R_lidar2enu)
+  │      噪声: R = rtk_yaw_cov  (默认 0.05 rad²)
+  │
+  └─ 5. state_point = kf.get_x() → map_incremental() → publish
+```
+
+#### 关键设计
+
+- **独立校正，不动 IKFoM**：RTK 和 yaw 不在 `h_share_model` 中拼接（IKFoM 硬编码 12 列），而是 IEKF 收敛后各做一次标准 EKF 更新。避免了 IKFoM 库修改和访存越界。
+- **各自噪声**：LiDAR 点面匹配用 `LASER_POINT_COV`，RTK 位置用 `rtk_pos_cov`，yaw 用 `rtk_yaw_cov`，不再混用。
+- **Joseph 协方差更新**：数值更稳定。
+- **`lidar_enu_est_en`**：关闭时雅可比列 23-28 填零，冻结刚体变换估计。
+
+#### 配置
+
+```yaml
+# config/mid360_rtk.yaml (或 velodyne_rtk.yaml)
+rtk:
+    rtk_mode_en: true
+    rtk_topic: "/rtk/odom"
+    rtk_fuse_en: true           # Mode 3
+    rtk_pos_cov: 0.01           # RTK 位置噪声 (m²)
+    rtk_yaw_en: true            # 启用 yaw 校正
+    rtk_yaw_topic: "/rtk/heading"
+    yaw_from_east_cw: true      # 源是 CW from East 时取反
+    rtk_yaw_cov: 0.05           # yaw 噪声 (rad²)
+    lidar_enu_est_en: true      # 在线估计 R/t
+    init_R_lidar2enu: [1,0,0, 0,1,0, 0,0,1]
+    init_t_lidar2enu: [0,0,0]
+    use_first_rtk_as_origin: false
+```
+
+#### 调参
+
+| 参数 | 默认 | 建议 |
+|------|------|------|
+| `rtk_pos_cov` | 0.01 | RTK 精度高→0.0025, 差→0.04 |
+| `rtk_yaw_cov` | 0.05 | 双天线→0.01, 磁力计→0.1 |
+| `lidar_enu_est_en` | true | 收敛后可关掉冻结 |
+
+### Mode 2 — RTK Localization
+
+直接读取 `/rtk/odom` 的完整 6-DOF 位姿覆写状态，跳过 LiDAR 匹配。适合快速建图，但 RTK 噪声会直接进入地图。
+
+---
 
 ## Usage
 
-### 1. Launch GNSS conversion
+### 坐标转换节点
 
 ```bash
-roslaunch gnss_conversion gnss_conversion.launch \
-    input_rtk_topic:=/your_gnss_fix \
-    output_odom_topic:=/rtk_odom
+roslaunch gnss_conversion gnss_conversion_4dof.launch
 ```
 
-Configurable parameters (see `gnss_conversion/config/gnss_conversion.yaml`):
+`gnss_conversion_4dof` 需要外部 yaw 源（`/rtk/heading`），输出 4-DOF odometry 到 `/rtk/odom`。若用 heading-from-motion，用 `gnss_conversion.launch`（3-DOF）。
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `input_rtk_topic` | `/rtk_fix` | Input GNSS topic (`sensor_msgs/NavSatFix`) |
-| `output_odom_topic` | `/rtk_odom` | Output odometry topic (`nav_msgs/Odometry`) |
-| `publish_tf` | `true` | Broadcast `odom→base_link` TF |
-| `jump_threshold` | `50.0` | Reset origin on position jump (meters) |
-| `heading_min_speed` | `0.5` | Min speed (m/s) to compute heading from motion |
-| `antenna_offset_x/y/z` | `0.0` | GNSS antenna offset in base_link frame |
+**确认 yaw 方向**：源是标准 CCW from East（朝北 = +90°）则在 yaml 中设 `yaw_from_east_cw: false`。
 
-### 2. Configure FAST_LIO mode
-
-Edit `FAST_LIO/config/velodyne_rtk.yaml`:
-
-```yaml
-rtk:
-    rtk_mode_en: true        # enable RTK (false = Mode 1)
-    rtk_topic: "/rtk_odom"
-    rtk_fuse_en: true        # true = Mode 3 (fusion), false = Mode 2 (override)
-    rtk_repeat_n: 5          # Mode 3 only: trust RTK ~5× more than LiDAR
-```
-
-### 3. Launch
+### FAST_LIO
 
 ```bash
-# Terminal 1
-roslaunch gnss_conversion gnss_conversion.launch
+# Livox Mid-360
+roslaunch fast_lio mapping_mid360_rtk.launch
 
-# Terminal 2
+# Velodyne
 roslaunch fast_lio mapping_velodyne_rtk.launch
 ```
 
-To switch modes, only the YAML config needs changing — no code recompilation required.
+### Mode 2 ↔ Mode 3 切换
 
-## Packages
+改 yaml 一行：
 
-| Package | Description |
-|---------|-------------|
-| [`FAST_LIO`](FAST_LIO/) | LiDAR-inertial odometry + RTK mapping mode (modified from [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO)) |
-| [`gnss_conversion`](gnss_conversion/) | GNSS NavSatFix → zero-based odometry conversion |
+```yaml
+rtk_fuse_en: false    # Mode 2
+rtk_fuse_en: true     # Mode 3
+```
 
 ## Coordinate Frames
 
-- **`odom`** — Local ENU frame with origin at the first GNSS fix
-- **`base_link`** — Vehicle body frame (TF broadcast by `gnss_conversion`)
-- **`camera_init`** — FAST_LIO map frame (first LiDAR scan pose)
-
-## License
-
-FAST_LIO is distributed under BSD license. See [FAST_LIO/LICENSE](FAST_LIO/LICENSE).
+| Frame | Origin |
+|-------|--------|
+| `odom` | First GNSS fix (local ENU) |
+| `base_link` | Vehicle body |
+| `camera_init` | First LiDAR scan |
