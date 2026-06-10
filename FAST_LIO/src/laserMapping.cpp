@@ -149,7 +149,7 @@ double rtk_yaw_cov           = 0.05;    // 航向残差协方差 (rad²), ~0.22 
 bool   lidar_enu_est_en      = true;    // false=冻结刚体变换 (雅可比对应列清零)
 M3D    init_R_lidar2enu      = Eye3d;   // 启动初值, 可从 yaml 覆盖
 V3D    init_t_lidar2enu      = Zero3d;  // 启动初值
-bool   use_first_rtk_as_origin = false; // true=把 t_lidar2enu 初始化为 -first_rtk_pos
+bool   use_first_rtk_as_origin = false; // true=把 t_lidar2enu 初始化为 first_rtk_pos
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -546,11 +546,11 @@ bool sync_packages(MeasureGroup &meas)
         }
         meas.has_rtk = true;
 
-        // use_first_rtk_as_origin: 首个 RTK 把 t_lidar2enu 初始化为 -rtk_pos
+        // use_first_rtk_as_origin: 首个 RTK 把 t_lidar2enu 初始化为 rtk_pos
         if (use_first_rtk_as_origin && rtk_first_scan)
         {
             state_ikfom x = kf.get_x();
-            x.t_lidar2enu = -meas.rtk_pos;
+            x.t_lidar2enu = meas.rtk_pos;
             kf.change_x(x);
             // 收紧协方差
             auto P = kf.get_P();
